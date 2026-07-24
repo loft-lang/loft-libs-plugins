@@ -1,0 +1,123 @@
+# Canonical library-ci.yml — Phase 6.5 refresh (2026-05-29).
+#
+# Supersedes the 2026-05-24 draft.  Three improvements over the
+# previous version, all backed by the canonical template in
+# jjstwerff/loft (doc/claude/lib_plans/12-library-extraction/
+# library-ci.yml.example):
+#
+#   1. Cache key based on loft Cargo.lock SHA (was a static key, so
+#      the loft build cache never invalidated when upstream loft
+#      shipped).
+#   2. LOFT_DENY_WARNINGS=1 by default — warnings fail CI.  A package
+#      opts out temporarily by placing a `.allow_warnings` file at its
+#      root (visible in PRs; remove once cleaned up).
+#   3. Two new conditional steps:
+#        - Rust integration tests (Phase 6t Tier 2/3) — only fires
+#          when a package has `<pkg>/native/tests/*.rs`.
+#        - `loft test --deps` (Phase 6t Tier 4) — exercises declared
+#          path-form deps so a consumer-facing release fails CI here
+#          rather than at a downstream consumer's CI.
+#
+# Per-package matrix → one PR check per package on failure.
+
+name: library-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [pluginabi]
+    steps:
+      - uses: actions/checkout@v4
+
+      # A machine-local `[patch.crates-io]` with absolute paths was once committed to
+      # crypto/native/Cargo.toml.  It built green on the machine that had those paths and
+      # was unbuildable everywhere else — including in a published tarball.  Cheap to
+      # catch, expensive to ship, so check it before spending 2 minutes building loft.
+      - name: Guard — no absolute paths in committed manifests
+        working-directory: ${{ matrix.package }}
+        run: |
+          if grep -rn -E '"/(home|Users|root)/' --include='*.toml' . ; then
+            echo "::error::${{ matrix.package }}: absolute local path in a committed manifest — a local override must not be committed (it breaks every other host and any published tarball)"
+            exit 1
+          fi
+          echo "no absolute paths in ${{ matrix.package }} manifests"
+
+      - name: Install mold (loft's pinned linker)
+        run: sudo apt-get update -y && sudo apt-get install -y mold
+
+      - name: Clone loft source
+        uses: actions/checkout@v4
+        with:
+          repository: jjstwerff/loft
+          path: loft-src
+
+      - name: Cache cargo registry + loft build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            loft-src/target
+          key: loft-${{ hashFiles('loft-src/Cargo.lock') }}
+          restore-keys: |
+            loft-
+
+      - name: Build loft from source
+        working-directory: loft-src
+        run: |
+          # `--lib --bin loft` builds BOTH the lib and the binary.
+          # Without `--lib`, cargo emits `libloft.rlib` only into
+          # `target/release/deps/`, not into the parent
+          # `target/release/`.  `loft --native` then fails to resolve
+          # transitive crates like `mmap_storage` / `rand_core` with
+          # `error[E0463]: can't find crate for X which loft depends
+          # on` — the deps-search path is the same `deps/` dir but
+          # rustc still can't link them.  Explicit `--lib` makes cargo
+          # place the canonical-name `libloft.rlib` at
+          # `target/release/libloft.rlib`, which is what
+          # `loft_lib_dir()` prefers and which makes the dep-search
+          # path resolve transitively.  Verified locally: a clean
+          # `cargo build --release --bin loft` reproduces the CI
+          # `mmap_storage` failure; adding `--lib` makes it green.
+          cargo build --release --lib --bin loft
+          echo "$PWD/target/release" >> $GITHUB_PATH
+
+      - name: Interpreter — loft test
+        working-directory: ${{ matrix.package }}
+        env:
+          LOFT_DENY_WARNINGS: ${{ hashFiles(format('{0}/.allow_warnings', matrix.package)) != '' && '0' || '1' }}
+        run: loft --interpret test
+
+      - name: Native — loft --native test
+        working-directory: ${{ matrix.package }}
+        env:
+          LOFT_DENY_WARNINGS: ${{ hashFiles(format('{0}/.allow_warnings', matrix.package)) != '' && '0' || '1' }}
+        run: loft --native test
+
+      # Phase 6t Tier 2/3 home — only fires when the library carries
+      # Rust-side integration tests (graphics gold-image, multiplayer
+      # subprocess harnesses, etc.).  Libraries without native/tests/
+      # skip the step cleanly.
+      - name: Rust integration tests (if present)
+        working-directory: ${{ matrix.package }}/native
+        if: hashFiles(format('{0}/native/tests/*.rs', matrix.package)) != ''
+        run: cargo test --release
+
+      # Phase 6t Tier 4 — exercise the library's transitive deps.
+      # `loft test --deps` walks every dep declared in the package's
+      # loft.toml (path-form deps first; registry-version deps require
+      # a loft.lock and become a no-op until that's in place) and runs
+      # its tests against the just-built loft.  Catches "we shipped a
+      # graphics version that broke gridmesh's tests in our
+      # environment" before downstream consumers do.
+      - name: Transitive dep tests
+        working-directory: ${{ matrix.package }}
+        run: loft test --deps

@@ -1,0 +1,153 @@
+// pluginabi — the §9c.2 plugin call protocol (Track L4, step 1).
+//
+// WHAT THIS IS. A plugin implements six pure functions (§9c.2). The host does NOT call them as
+// six named wasm exports — that would need a codegen feature loft does not have, and inventing a
+// per-plugin `(ptr,len)` ABI beside loft's own was the mistake the first two design drafts made.
+// Instead the host drives the plugin over the byte channel loft ALREADY exposes on every wasm it
+// compiles (`loft_io.loft_host_input_len` / `loft_host_input_copy` in, `loft_host_print` out,
+// pumped by the host) — exactly the shape `tools/wasm_debug_client.mjs` drives the debugger with.
+//
+// So the six operations are FRAMES on one channel, and this file is that frame vocabulary. It is
+// the only thing either side needs to agree on: no ABI, no shim, no runtime. See
+// doc/PLUGIN_RUNTIME.md § "P3 results".
+//
+// WHY CBOR AND NOT A TEXT PROTOCOL. The debugger's `D!:` frames are text because breakpoints and
+// expressions are text. Plugin payloads are opaque BYTES (state, ops, snapshots — §9c.2 says the
+// plugin owns their meaning), and they must survive a round-trip unchanged; canonical CBOR
+// already carries byte strings losslessly here and is what every other record in this project
+// uses. Reusing it means the §8.15 determinism story needs no second encoding to reason about.
+//
+// Run: `loft test`.
+use cbor;     // the published canonical-CBOR codec
+use crypto;   // base64 <-> bytes
+
+// ---------- CBOR helpers ----------
+// Inlined rather than depending on a project-local CBOR wrapper: a published protocol library
+// must stand on published deps alone. These are the same shapes `zero-trust-shared-files`'
+// `lib/ztcbor` uses, kept deliberately thin.
+fn ctext(s: text) -> CborValue        { return CText { value: s }; }
+fn cbool(b: boolean) -> CborValue     { return CBool { value: b }; }
+fn cbytes_b64(b64: text) -> CborValue { return CBytes { value: base64_to_bytes(b64) }; }
+fn te(k: text, v: CborValue) -> CborEntry { return CborEntry { key: CText { value: k }, value: v }; }
+
+fn decode_value(bytes: vector<u8>) -> CborValue {
+  d = decode(bytes);
+  v = d.value;      // local copy — returning d.value directly corrupts native (loft #425)
+  return v;
+}
+fn decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
+
+fn get_field_t(m: CborValue, key: text) -> CborValue {
+  match m {
+    CMap { entries } => {
+      for i in 0..len(entries) {
+        e = entries[i] ?? CborEntry { key: CNull, value: CNull };
+        match e.key { CText { value } => { if value == key { r = e.value; return r; } }, _ => {} }
+      }
+    },
+    _ => {},
+  }
+  return CNull;
+}
+fn field_text_t(m: CborValue, key: text) -> text {
+  match get_field_t(m, key) { CText { value } => { return "{value}"; }, _ => {} }
+  return "";
+}
+fn field_bytes_t(m: CborValue, key: text) -> text {
+  match get_field_t(m, key) { CBytes { value } => { return bytes_to_base64(value); }, _ => {} }
+  return "";
+}
+
+// ---------- the operation vocabulary (§9c.2) ----------
+// The six, and only these six. `valid_op` is the gate: a host that receives an unknown op must
+// reject rather than guess, because a plugin and host disagreeing about the vocabulary is a
+// version skew, not a request to be interpreted.
+pub const OP_INITIAL_STATE: text = "initial_state";
+pub const OP_APPLY_OP:      text = "apply_op";
+pub const OP_MAKE_OP:       text = "make_op";
+pub const OP_RENDER:        text = "render";
+pub const OP_SNAPSHOT:      text = "snapshot";
+pub const OP_LOAD_SNAPSHOT: text = "load_snapshot";
+
+pub fn valid_op(op: text) -> boolean {
+  return (op == OP_INITIAL_STATE) || (op == OP_APPLY_OP) || (op == OP_MAKE_OP)
+      || (op == OP_RENDER) || (op == OP_SNAPSHOT) || (op == OP_LOAD_SNAPSHOT);
+}
+
+// Which operations read the `arg` slot. Recorded here rather than in each host so the two sides
+// cannot drift: a host that sends `arg` for `snapshot` is confused about the contract, and a
+// plugin that reads it would be reading whatever the host happened to leave there.
+pub fn takes_arg(op: text) -> boolean {
+  return (op == OP_APPLY_OP) || (op == OP_MAKE_OP);
+}
+
+// ---------- request frames ----------
+// { "op": text, "state": bytes, "arg": bytes }
+//
+// `state` is always present (the empty byte string for `initial_state`), so the plugin never has
+// to distinguish "absent" from "empty" — an absent-vs-empty ambiguity across a wire is exactly
+// the kind of thing that produces a plausible wrong answer instead of an error.
+pub fn request(op: text, state_b64: text, arg_b64: text) -> vector<u8> {
+  es: vector<CborEntry> = [];
+  es += [ te("op", ctext(op)) ];
+  es += [ te("state", cbytes_b64(state_b64)) ];
+  es += [ te("arg", cbytes_b64(arg_b64)) ];
+  return encode(CMap { entries: es });
+}
+
+pub fn req_op(frame: vector<u8>) -> text        { return field_text_t(decode_value(frame), "op"); }
+pub fn req_state_b64(frame: vector<u8>) -> text { return field_bytes_t(decode_value(frame), "state"); }
+pub fn req_arg_b64(frame: vector<u8>) -> text   { return field_bytes_t(decode_value(frame), "arg"); }
+
+// ---------- reply frames ----------
+// success: { "ok": true,  "out": bytes }
+// failure: { "ok": false, "err": text }
+//
+// A failure carries a CODE, not a message: the host shows it to a person, and a free-form string
+// from the plugin would be the one channel out of the sandbox that is neither bytes-the-host-
+// inspects (render) nor a value it asked for. §9c.5 keeps render output the only rich channel.
+pub fn reply_ok(out_b64: text) -> vector<u8> {
+  es: vector<CborEntry> = [];
+  es += [ te("ok", cbool(true)) ];
+  es += [ te("out", cbytes_b64(out_b64)) ];
+  return encode(CMap { entries: es });
+}
+
+pub fn reply_err(code: text) -> vector<u8> {
+  es: vector<CborEntry> = [];
+  es += [ te("ok", cbool(false)) ];
+  es += [ te("err", ctext(code)) ];
+  return encode(CMap { entries: es });
+}
+
+// true only for a well-formed success reply. A frame that does not decode, or whose `ok` is not
+// the boolean true, reads as failure — the fail-closed direction.
+pub fn reply_is_ok(frame: vector<u8>) -> boolean {
+  if !decode_ok(frame) { return false; }
+  match get_field_t(decode_value(frame), "ok") {
+    CBool { value } => { return value; },
+    _ => { return false; },
+  }
+}
+
+pub fn reply_out_b64(frame: vector<u8>) -> text { return field_bytes_t(decode_value(frame), "out"); }
+pub fn reply_err_code(frame: vector<u8>) -> text { return field_text_t(decode_value(frame), "err"); }
+
+// ---------- the error codes a host may produce ----------
+// Closed set, so a host and a UI cannot drift. `ERR_UNKNOWN_OP` is the version-skew case above;
+// `ERR_MALFORMED` is a frame that did not decode; `ERR_PLUGIN` is the plugin reporting it could
+// not satisfy a well-formed request (§9c.2 permits that — e.g. load_snapshot on foreign bytes).
+pub const ERR_UNKNOWN_OP: text = "unknown-op";
+pub const ERR_MALFORMED:  text = "malformed-frame";
+pub const ERR_PLUGIN:     text = "plugin-error";
+
+// Validate an inbound request frame the way a host must, BEFORE dispatching it: decode, then
+// check the vocabulary. Returns "" when the frame is acceptable, else the error code to reply
+// with. Centralised so every host does the same two checks in the same order rather than each
+// re-deriving them — the §9c.2 contract has one front door.
+pub fn check_request(frame: vector<u8>) -> text {
+  if !decode_ok(frame) { return ERR_MALFORMED; }
+  op = field_text_t(decode_value(frame), "op");
+  if !valid_op(op) { return ERR_UNKNOWN_OP; }
+  return "";
+}

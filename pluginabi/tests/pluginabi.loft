@@ -1,0 +1,165 @@
+// Tests for pluginabi — the §9c.2 plugin call protocol. Run: `loft test`.
+//
+// The load-bearing test is the last one: a COMPLETE six-operation plugin driven end to end over
+// nothing but frames. If the protocol were missing something a real plugin needs, that test could
+// not be written — which is the point of writing it here rather than asserting field-by-field.
+use pluginabi;
+use cbor;
+use crypto;
+
+// Fixture helpers. The library keeps its CBOR shims PRIVATE — exporting them is not a protocol
+// library's job — so a test that builds its own payloads brings its own, exactly as a real plugin
+// author would.
+fn t_te(k: text, v: CborValue) -> CborEntry { return CborEntry { key: CText { value: k }, value: v }; }
+fn t_cuint(n: integer) -> CborValue { return CInt { value: n }; }
+fn t_decode(bytes: vector<u8>) -> CborValue { d = decode(bytes); v = d.value; return v; }
+fn t_decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
+fn t_uint(m: CborValue, key: text) -> integer {
+  match m {
+    CMap { entries } => {
+      for i in 0..len(entries) {
+        e = entries[i] ?? CborEntry { key: CNull, value: CNull };
+        match e.key { CText { value } => {
+          if value == key { match e.value { CInt { value } => { return value; }, _ => {} } }
+        }, _ => {} }
+      }
+    },
+    _ => {},
+  }
+  return 0;
+}
+
+fn test_request_round_trip() {
+  st = bytes_to_base64([1 as u8, 2 as u8, 255 as u8]);   // binary, incl. a non-UTF-8 byte
+  ar = bytes_to_base64([0 as u8, 7 as u8]);
+  f = request(OP_APPLY_OP, st, ar);
+
+  assert(req_op(f) == OP_APPLY_OP, "op round-trips");
+  assert(req_state_b64(f) == st, "state round-trips byte-exactly");
+  assert(req_arg_b64(f) == ar, "arg round-trips byte-exactly");
+
+  // the empty-state case: `initial_state` sends "" rather than omitting the field, so a plugin
+  // never has to tell absent from empty
+  e = request(OP_INITIAL_STATE, "", "");
+  assert(req_state_b64(e) == "" && req_arg_b64(e) == "", "empty state/arg survive as empty");
+  assert(req_op(e) == OP_INITIAL_STATE, "op survives alongside empty payloads");
+}
+
+fn test_reply_round_trip_and_fails_closed() {
+  out = bytes_to_base64([9 as u8, 9 as u8]);
+  ok = reply_ok(out);
+  assert(reply_is_ok(ok), "a success reply reads as ok");
+  assert(reply_out_b64(ok) == out, "its payload round-trips");
+
+  er = reply_err(ERR_PLUGIN);
+  assert(!reply_is_ok(er), "a failure reply does NOT read as ok");
+  assert(reply_err_code(er) == ERR_PLUGIN, "its code round-trips");
+
+  // FAIL-CLOSED: anything that is not a well-formed success must read as failure, never as ok.
+  // This is the direction that matters — a garbled frame optimistically read as success would
+  // hand the host whatever bytes happened to decode.
+  assert(!reply_is_ok([]), "an empty frame is not ok");
+  assert(!reply_is_ok([1 as u8, 2 as u8, 3 as u8]), "garbage bytes are not ok");
+  assert(!reply_is_ok(request(OP_RENDER, "", "")), "a REQUEST frame is not a success reply");
+}
+
+fn test_check_request_is_the_front_door() {
+  good = request(OP_SNAPSHOT, "", "");
+  assert(check_request(good) == "", "a well-formed known op passes");
+
+  assert(check_request([7 as u8, 7 as u8]) == ERR_MALFORMED, "undecodable -> malformed");
+  assert(check_request([]) == ERR_MALFORMED, "empty -> malformed");
+
+  // version skew: an op this host does not know must be REJECTED, not guessed at
+  unknown = request("apply_ops", "", "");            // note the typo/newer name
+  assert(check_request(unknown) == ERR_UNKNOWN_OP, "an unknown op is rejected, not interpreted");
+
+  // the vocabulary is exactly six
+  n = 0;
+  for o in [OP_INITIAL_STATE, OP_APPLY_OP, OP_MAKE_OP, OP_RENDER, OP_SNAPSHOT, OP_LOAD_SNAPSHOT] {
+    if valid_op(o) { n = n + 1; }
+  }
+  assert(n == 6, "all six operations are in the vocabulary");
+  assert(!valid_op("") && !valid_op("eval") && !valid_op("exec"), "nothing else is");
+  assert(takes_arg(OP_APPLY_OP) && takes_arg(OP_MAKE_OP), "apply_op/make_op read arg");
+  assert(!takes_arg(OP_SNAPSHOT) && !takes_arg(OP_INITIAL_STATE), "the others do not");
+}
+
+// ---------- a complete plugin, driven only by frames ----------
+// A counter: state is CBOR { "n": uint }; an op is CBOR { "d": uint } (a delta). The plugin owns
+// that encoding — the protocol only carries bytes, which is the §9c.2 contract.
+fn plug_state(n: integer) -> text {
+  es: vector<CborEntry> = []; es += [ t_te("n", t_cuint(n)) ];
+  return bytes_to_base64(encode(CMap { entries: es }));
+}
+fn plug_n(state_b64: text) -> integer {
+  if state_b64 == "" { return 0; }
+  return t_uint(t_decode(base64_to_bytes(state_b64)), "n");
+}
+fn plug_delta(arg_b64: text) -> integer {
+  if arg_b64 == "" { return 0; }
+  return t_uint(t_decode(base64_to_bytes(arg_b64)), "d");
+}
+
+// THE PLUGIN: one entry point, frame in -> frame out. This is what the wasm pump calls.
+fn plugin_dispatch(frame: vector<u8>) -> vector<u8> {
+  bad = check_request(frame);
+  if bad != "" { return reply_err(bad); }
+  op = req_op(frame);
+  st = req_state_b64(frame);
+  ar = req_arg_b64(frame);
+
+  if op == OP_INITIAL_STATE { return reply_ok(plug_state(0)); }
+  if op == OP_APPLY_OP      { return reply_ok(plug_state(plug_n(st) + plug_delta(ar))); }
+  if op == OP_MAKE_OP       { return reply_ok(ar); }
+  if op == OP_RENDER        { return reply_ok(base64_encode("count={plug_n(st)}")); }
+  if op == OP_SNAPSHOT      { return reply_ok(st); }
+  if op == OP_LOAD_SNAPSHOT {
+    if !t_decode_ok(base64_to_bytes(st)) { return reply_err(ERR_PLUGIN); }   // foreign bytes
+    return reply_ok(st);
+  }
+  return reply_err(ERR_UNKNOWN_OP);
+}
+
+fn call(op: text, st: text, ar: text) -> vector<u8> { return plugin_dispatch(request(op, st, ar)); }
+
+fn test_a_whole_plugin_over_frames() {
+  // initial_state
+  r = call(OP_INITIAL_STATE, "", "");
+  assert(reply_is_ok(r), "initial_state succeeds");
+  st = reply_out_b64(r);
+  assert(plug_n(st) == 0, "a fresh state counts zero");
+
+  // make_op then apply_op, twice — the host never touches the plugin's encoding
+  d5 = reply_out_b64(call(OP_MAKE_OP, st, plug_delta_arg(5)));
+  st = reply_out_b64(call(OP_APPLY_OP, st, d5));
+  d7 = reply_out_b64(call(OP_MAKE_OP, st, plug_delta_arg(7)));
+  st = reply_out_b64(call(OP_APPLY_OP, st, d7));
+  assert(plug_n(st) == 12, "5 + 7 folded through frames = 12");
+
+  // render — the host-visible channel
+  rr = call(OP_RENDER, st, "");
+  assert(reply_is_ok(rr) && base64_decode(reply_out_b64(rr)) == "count=12", "render reflects state");
+
+  // snapshot -> load_snapshot round-trips to the SAME state (the §9c.1 rollover contract)
+  snap = reply_out_b64(call(OP_SNAPSHOT, st, ""));
+  back = call(OP_LOAD_SNAPSHOT, snap, "");
+  assert(reply_is_ok(back), "a snapshot loads");
+  assert(plug_n(reply_out_b64(back)) == 12, "and restores the same count");
+
+  // a plugin may refuse a well-formed request — foreign snapshot bytes
+  bad = call(OP_LOAD_SNAPSHOT, bytes_to_base64([200 as u8, 201 as u8]), "");
+  assert(!reply_is_ok(bad) && reply_err_code(bad) == ERR_PLUGIN,
+    "load_snapshot on foreign bytes is a plugin error, not a protocol error");
+
+  // and the host rejects an op the plugin never sees
+  sk = plugin_dispatch(request("teleport", st, ""));
+  assert(!reply_is_ok(sk) && reply_err_code(sk) == ERR_UNKNOWN_OP, "an unknown op never reaches the plugin body");
+
+  println("plugins: pluginabi — §9c.2 frame protocol + a whole plugin driven over frames OK");
+}
+
+fn plug_delta_arg(d: integer) -> text {
+  es: vector<CborEntry> = []; es += [ t_te("d", t_cuint(d)) ];
+  return bytes_to_base64(encode(CMap { entries: es }));
+}
