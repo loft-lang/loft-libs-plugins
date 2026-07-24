@@ -23,21 +23,26 @@ use crypto;   // base64 <-> bytes
 
 // ---------- CBOR helpers ----------
 // Inlined rather than depending on a project-local CBOR wrapper: a published protocol library
-// must stand on published deps alone. These are the same shapes `zero-trust-shared-files`'
-// `lib/ztcbor` uses, kept deliberately thin.
-fn ctext(s: text) -> CborValue        { return CText { value: s }; }
-fn cbool(b: boolean) -> CborValue     { return CBool { value: b }; }
-fn cbytes_b64(b64: text) -> CborValue { return CBytes { value: base64_to_bytes(b64) }; }
-fn te(k: text, v: CborValue) -> CborEntry { return CborEntry { key: CText { value: k }, value: v }; }
+// must stand on published deps alone.
+//
+// ALL PREFIXED `pa_`, and that is not cosmetic. A library's PRIVATE helpers still share a name
+// space with every other library in a consumer's program, so a plain `decode_value` here collides
+// with a consumer's own `decode_value` — which is exactly what happened: the collision was
+// invisible in this package's own tests and in a minimal consumer, and only surfaced in a program
+// that used both. A published library must not impose names a consumer cannot see coming.
+fn pa_ctext(s: text) -> CborValue        { return CText { value: s }; }
+fn pa_cbool(b: boolean) -> CborValue     { return CBool { value: b }; }
+fn pa_cbytes(b64: text) -> CborValue { return CBytes { value: base64_to_bytes(b64) }; }
+fn pa_te(k: text, v: CborValue) -> CborEntry { return CborEntry { key: CText { value: k }, value: v }; }
 
-fn decode_value(bytes: vector<u8>) -> CborValue {
+fn pa_decode(bytes: vector<u8>) -> CborValue {
   d = decode(bytes);
   v = d.value;      // local copy — returning d.value directly corrupts native (loft #425)
   return v;
 }
-fn decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
+fn pa_decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
 
-fn get_field_t(m: CborValue, key: text) -> CborValue {
+fn pa_get(m: CborValue, key: text) -> CborValue {
   match m {
     CMap { entries } => {
       for i in 0..len(entries) {
@@ -49,12 +54,12 @@ fn get_field_t(m: CborValue, key: text) -> CborValue {
   }
   return CNull;
 }
-fn field_text_t(m: CborValue, key: text) -> text {
-  match get_field_t(m, key) { CText { value } => { return "{value}"; }, _ => {} }
+fn pa_text(m: CborValue, key: text) -> text {
+  match pa_get(m, key) { CText { value } => { return "{value}"; }, _ => {} }
   return "";
 }
-fn field_bytes_t(m: CborValue, key: text) -> text {
-  match get_field_t(m, key) { CBytes { value } => { return bytes_to_base64(value); }, _ => {} }
+fn pa_bytes(m: CborValue, key: text) -> text {
+  match pa_get(m, key) { CBytes { value } => { return bytes_to_base64(value); }, _ => {} }
   return "";
 }
 
@@ -89,15 +94,15 @@ pub fn takes_arg(op: text) -> boolean {
 // the kind of thing that produces a plausible wrong answer instead of an error.
 pub fn request(op: text, state_b64: text, arg_b64: text) -> vector<u8> {
   es: vector<CborEntry> = [];
-  es += [ te("op", ctext(op)) ];
-  es += [ te("state", cbytes_b64(state_b64)) ];
-  es += [ te("arg", cbytes_b64(arg_b64)) ];
+  es += [ pa_te("op", pa_ctext(op)) ];
+  es += [ pa_te("state", pa_cbytes(state_b64)) ];
+  es += [ pa_te("arg", pa_cbytes(arg_b64)) ];
   return encode(CMap { entries: es });
 }
 
-pub fn req_op(frame: vector<u8>) -> text        { return field_text_t(decode_value(frame), "op"); }
-pub fn req_state_b64(frame: vector<u8>) -> text { return field_bytes_t(decode_value(frame), "state"); }
-pub fn req_arg_b64(frame: vector<u8>) -> text   { return field_bytes_t(decode_value(frame), "arg"); }
+pub fn req_op(frame: vector<u8>) -> text        { return pa_text(pa_decode(frame), "op"); }
+pub fn req_state_b64(frame: vector<u8>) -> text { return pa_bytes(pa_decode(frame), "state"); }
+pub fn req_arg_b64(frame: vector<u8>) -> text   { return pa_bytes(pa_decode(frame), "arg"); }
 
 // ---------- reply frames ----------
 // success: { "ok": true,  "out": bytes }
@@ -108,30 +113,30 @@ pub fn req_arg_b64(frame: vector<u8>) -> text   { return field_bytes_t(decode_va
 // inspects (render) nor a value it asked for. §9c.5 keeps render output the only rich channel.
 pub fn reply_ok(out_b64: text) -> vector<u8> {
   es: vector<CborEntry> = [];
-  es += [ te("ok", cbool(true)) ];
-  es += [ te("out", cbytes_b64(out_b64)) ];
+  es += [ pa_te("ok", pa_cbool(true)) ];
+  es += [ pa_te("out", pa_cbytes(out_b64)) ];
   return encode(CMap { entries: es });
 }
 
 pub fn reply_err(code: text) -> vector<u8> {
   es: vector<CborEntry> = [];
-  es += [ te("ok", cbool(false)) ];
-  es += [ te("err", ctext(code)) ];
+  es += [ pa_te("ok", pa_cbool(false)) ];
+  es += [ pa_te("err", pa_ctext(code)) ];
   return encode(CMap { entries: es });
 }
 
 // true only for a well-formed success reply. A frame that does not decode, or whose `ok` is not
 // the boolean true, reads as failure — the fail-closed direction.
 pub fn reply_is_ok(frame: vector<u8>) -> boolean {
-  if !decode_ok(frame) { return false; }
-  match get_field_t(decode_value(frame), "ok") {
+  if !pa_decode_ok(frame) { return false; }
+  match pa_get(pa_decode(frame), "ok") {
     CBool { value } => { return value; },
     _ => { return false; },
   }
 }
 
-pub fn reply_out_b64(frame: vector<u8>) -> text { return field_bytes_t(decode_value(frame), "out"); }
-pub fn reply_err_code(frame: vector<u8>) -> text { return field_text_t(decode_value(frame), "err"); }
+pub fn reply_out_b64(frame: vector<u8>) -> text { return pa_bytes(pa_decode(frame), "out"); }
+pub fn reply_err_code(frame: vector<u8>) -> text { return pa_text(pa_decode(frame), "err"); }
 
 // ---------- the error codes a host may produce ----------
 // Closed set, so a host and a UI cannot drift. `ERR_UNKNOWN_OP` is the version-skew case above;
@@ -146,8 +151,8 @@ pub const ERR_PLUGIN:     text = "plugin-error";
 // with. Centralised so every host does the same two checks in the same order rather than each
 // re-deriving them — the §9c.2 contract has one front door.
 pub fn check_request(frame: vector<u8>) -> text {
-  if !decode_ok(frame) { return ERR_MALFORMED; }
-  op = field_text_t(decode_value(frame), "op");
+  if !pa_decode_ok(frame) { return ERR_MALFORMED; }
+  op = pa_text(pa_decode(frame), "op");
   if !valid_op(op) { return ERR_UNKNOWN_OP; }
   return "";
 }
