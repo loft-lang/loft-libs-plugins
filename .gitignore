@@ -2,3 +2,4 @@ target/
 .loft/
 loft.lock
 *.tar.gz
+native-auto/

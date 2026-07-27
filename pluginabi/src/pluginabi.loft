@@ -43,16 +43,22 @@ fn pa_decode(bytes: vector<u8>) -> CborValue {
 fn pa_decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
 
 fn pa_get(m: CborValue, key: text) -> CborValue {
+  // The `match` is the function's final EXPRESSION (fallback `CNull` in the arm tails), NOT a
+  // statement followed by `return CNull`. Those two forms are logically identical, but the
+  // statement form corrupts the early-returned `r` once its embedded vector is large enough
+  // (~54 bytes) — on interpret AND native — because `r` is a heap CborValue and the fall-through
+  // path frees it while it is still the live return value. See loft#651. The expression form is
+  // the workaround until that is fixed; every plugin frame read funnels through here.
   match m {
     CMap { entries } => {
       for i in 0..len(entries) {
         e = entries[i] ?? CborEntry { key: CNull, value: CNull };
         match e.key { CText { value } => { if value == key { r = e.value; return r; } }, _ => {} }
       }
+      CNull
     },
-    _ => {},
+    _ => CNull,
   }
-  return CNull;
 }
 fn pa_text(m: CborValue, key: text) -> text {
   match pa_get(m, key) { CText { value } => { return "{value}"; }, _ => {} }
