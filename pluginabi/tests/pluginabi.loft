@@ -63,6 +63,29 @@ fn test_reply_round_trip_and_fails_closed() {
   assert(!reply_is_ok(request(OP_RENDER, "", "")), "a REQUEST frame is not a success reply");
 }
 
+// Large-payload coverage (loft#651). Every other test used 2-3 byte payloads; a real `merge3`
+// frame carries a whole serialized document, so large fields are the COMMON case. This asserts the
+// contract holds to 300 bytes. NOTE: loft#651 (the crash where `pa_get`'s old statement-form
+// `match` corrupted a heap CborValue past ~54 bytes) is CONTEXT-SENSITIVE — it fires reliably as a
+// standalone program but NOT inside this test harness, so this test does not by itself distinguish
+// the buggy `pa_get` from the fixed one. The reliable repro is a program (see the zero-trust repo's
+// upstream/match-stmt-return-heap-repro.loft); this test guards the contract and documents intent.
+fn test_large_payload_round_trip() {
+  for sz in [1, 40, 53, 54, 100, 300] {
+    raw: vector<u8> = []; for i in 0..sz { raw += [ ((i * 7 + 3) & 255) as u8 ]; }
+    b64 = bytes_to_base64(raw);
+    // request: state AND arg both large; both must survive the read path (arg is the LAST field).
+    f = request(OP_APPLY_OP, b64, b64);
+    assert(req_state_b64(f) == b64, "large state round-trips byte-exactly (sz={sz})");
+    assert(req_arg_b64(f) == b64, "large arg round-trips byte-exactly (sz={sz})");
+    // reply: a large `out` must survive reply_out_b64, and reply_is_ok must not choke on it.
+    r = reply_ok(b64);
+    assert(reply_is_ok(r), "a large success reply reads as ok (sz={sz})");
+    assert(reply_out_b64(r) == b64, "large reply out round-trips byte-exactly (sz={sz})");
+  }
+  println("plugins: pluginabi — large frame payloads (to 300 bytes) round-trip byte-exactly");
+}
+
 fn test_check_request_is_the_front_door() {
   good = request(OP_SNAPSHOT, "", "");
   assert(check_request(good) == "", "a well-formed known op passes");

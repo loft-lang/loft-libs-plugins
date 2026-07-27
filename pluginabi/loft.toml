@@ -1,6 +1,6 @@
 [package]
 name = "pluginabi"
-version = "0.1.1"
+version = "0.1.2"
 loft = ">=0.8"
 description = "Plugin call protocol — the six-operation contract (initial_state / apply_op / make_op / render / snapshot / load_snapshot) as canonical-CBOR frames over a byte channel. Host-agnostic: no ABI, no shim, no runtime."
 repository = "loft-libs-plugins"
