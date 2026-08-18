@@ -1,0 +1,168 @@
+// Copyright (c) 2026 Jurjen Stellingwerff
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//
+// One test per non-obvious contract, and each one is that contract's
+// worked EXAMPLE.
+//
+// ⚠⚠ **The pair is the deliverable.**  A snippet in a doc comment rots
+// silently — nothing compiles it, so it goes stale at the first
+// signature change and the reader finds out.  A test nobody links to is
+// correct and invisible.  So every function below carries an
+// `// Example: @PAB-0NN` line pointing here, and every tag here is
+// reachable from the functions it demonstrates.
+//
+// ⚠ These are examples FIRST and assertions second: each is written the
+// way a host or a plugin author would actually write the call.
+// `tests/pluginabi.loft` already pins that the frames round-trip; what
+// these pin is the shape of a CORRECT CALL — and `@PAB-004` is that
+// file's whole-plugin test, which is the best example this package has.
+//
+// Why this library owes them: **a frame is `vector<u8>` and every
+// payload is `text`.**  The signatures say bytes-in / bytes-out and
+// text-in / text-out, and never that the text must be BASE64, that the
+// `text` a reply hands back is `""` for two opposite outcomes, or that
+// the front door checks the envelope and not the letter.  Each is a
+// well-typed call that answers something other than it appears to.
+use pluginabi;
+use cbor;
+use crypto;
+
+// Sending a payload.
+//
+// ⚠⚠ **Every payload crossing this API is BASE64 TEXT, not the bytes and
+// not the string.**  The frame is `vector<u8>`, so the base64 layer is
+// invisible at the call site — and handing `request` a raw string is not
+// an error, it is silent truncation to whatever prefix happens to be a
+// whole base64 quantum.
+// @PAB-001 — a payload is base64 text, and a raw string is silently cut
+fn test_a_payload_is_base64_text() {
+  // ⚠ The mistake, spelled the way it types.  "hello" is five characters
+  // that `base64_to_bytes` reads as base64: "hell" is one whole quantum
+  // (three bytes) and the trailing "o" is an incomplete one, dropped.
+  pb_wrong = request(OP_APPLY_OP, "hello", "");
+  assert(req_state_b64(pb_wrong) == "hell",
+         "the payload came back as [{req_state_b64(pb_wrong)}]");
+  assert(len(base64_to_bytes("hello")) == 3, "five characters became three bytes");
+
+  // Nothing anywhere failed: the op is intact, the frame decodes, and the
+  // state a plugin receives is three bytes it never asked for.
+  assert(req_op(pb_wrong) == OP_APPLY_OP, "the frame is well formed");
+  assert(check_request(pb_wrong) == "", "and the front door admits it");
+
+  // The correct spelling — encode at the boundary, decode at the far end:
+  pb_right = request(OP_APPLY_OP, base64_encode("hello"), "");
+  assert(req_state_b64(pb_right) == "aGVsbG8=", "base64 on the wire");
+  assert(base64_decode(req_state_b64(pb_right)) == "hello", "and back out again");
+
+  // For real binary state — which is the common case, since a plugin owns
+  // its own encoding — `bytes_to_base64` is the door, and it survives a
+  // byte no UTF-8 reader could carry.
+  pb_raw: vector<u8> = [0 as u8, 200 as u8, 255 as u8];
+  pb_bin = request(OP_APPLY_OP, bytes_to_base64(pb_raw), "");
+  assert(len(base64_to_bytes(req_state_b64(pb_bin))) == 3, "three bytes in, three out");
+  assert(bytes_to_base64(pb_raw) == req_state_b64(pb_bin), "byte-exact");
+}
+
+// Reading a reply.
+//
+// ⚠⚠ **`reply_is_ok` is the only function that classifies a reply.**
+// `reply_out_b64` answers `""` for a failure — the same `""` a success
+// carrying an empty payload answers — and `reply_err_code` answers `""`
+// for a success, the same `""` an error code would have to be to be
+// absent.  So neither accessor can be read as a verdict, in either
+// direction.
+// @PAB-002 — ask reply_is_ok first; "" is both outcomes' answer
+fn test_only_reply_is_ok_classifies_a_reply() {
+  rp_fail = reply_err(ERR_PLUGIN);
+  rp_empty = reply_ok("");            // a genuine success with nothing to return
+
+  // ⚠ The two payload reads are indistinguishable:
+  assert(reply_out_b64(rp_fail) == "", "a failure has no out");
+  assert(reply_out_b64(rp_empty) == "", "and neither has an empty success");
+
+  // ⚠ ...and so are the two code reads, the other way round:
+  assert(reply_err_code(rp_empty) == "", "a success has no code");
+  assert(reply_err_code(rp_fail) == ERR_PLUGIN, "the failure's code is there");
+
+  // The verdict, and the only one:
+  assert(!reply_is_ok(rp_fail), "the failure is a failure");
+  assert(reply_is_ok(rp_empty), "the empty success is a success");
+
+  // It fails CLOSED, which is the direction that matters: a truncated or
+  // garbled frame, or one sent in the wrong direction, is never read as
+  // a success carrying whatever bytes happened to decode.
+  assert(!reply_is_ok([]), "an empty frame is not a success");
+  assert(!reply_is_ok([1 as u8, 2 as u8, 3 as u8]), "garbage is not a success");
+  assert(!reply_is_ok(request(OP_RENDER, "", "")), "a REQUEST is not a success reply");
+
+  // So the host's read order is fixed: verdict, then payload.
+  assert(host_reads(rp_empty) == "ok:", "an empty success reads {host_reads(rp_empty)}");
+  assert(host_reads(rp_fail) == "err:plugin-error", "a failure reads {host_reads(rp_fail)}");
+  assert(host_reads([9 as u8]) == "err:", "garbage reads {host_reads([9 as u8])}");
+}
+
+// The read order the example above recommends: classify, then read the
+// one field that outcome has.
+fn host_reads(hr_frame: vector<u8>) -> text {
+  if reply_is_ok(hr_frame) { return "ok:{reply_out_b64(hr_frame)}"; }
+  return "err:{reply_err_code(hr_frame)}";
+}
+
+// Admitting an inbound request.
+//
+// ⚠⚠ **`check_request` checks the ENVELOPE, and `""` is its pass.**  It
+// decodes the frame and looks the op up in the vocabulary — nothing
+// else.  A known op carrying payload bytes the plugin cannot use passes;
+// an `arg` present for an operation that does not take one passes; and a
+// REPLY frame handed to it comes back `unknown-op`, because a reply
+// decodes perfectly and simply has no `op`.
+// @PAB-003 — the front door validates the frame, never the payload
+fn test_the_front_door_checks_the_envelope() {
+  // ⚠ `""` means ACCEPTABLE.  The return is the code to reply WITH, so
+  // the check reads backwards from every boolean guard around it.
+  fd_good = request(OP_SNAPSHOT, base64_encode("state"), "");
+  assert(check_request(fd_good) == "", "a well-formed known op passes");
+
+  // What it does catch, and the two codes it distinguishes:
+  assert(check_request([7 as u8, 7 as u8]) == ERR_MALFORMED, "undecodable is malformed");
+  assert(check_request([]) == ERR_MALFORMED, "so is empty");
+  assert(check_request(request("apply_ops", "", "")) == ERR_UNKNOWN_OP,
+         "a near-miss op is version skew, not a request to interpret");
+
+  // ⚠ What it does NOT catch — a known op whose state is bytes no plugin
+  // could load.  That is the PLUGIN's answer to give, and `ERR_PLUGIN`
+  // is how it says so; the front door has no opinion.
+  fd_foreign = request(OP_LOAD_SNAPSHOT, bytes_to_base64([200 as u8, 201 as u8]), "");
+  assert(check_request(fd_foreign) == "", "foreign payload bytes are admitted");
+
+  // ⚠ Nor an `arg` sent for an operation that reads none.  `takes_arg`
+  // records which four do not, so the two sides cannot drift — but it is
+  // a contract both must consult, not a gate either one enforces.
+  fd_extra = request(OP_SNAPSHOT, base64_encode("s"), base64_encode("a"));
+  assert(!takes_arg(OP_SNAPSHOT), "snapshot reads no arg");
+  assert(check_request(fd_extra) == "", "yet a frame carrying one is admitted");
+  assert(req_arg_b64(fd_extra) == base64_encode("a"), "and the arg is sitting there, readable");
+
+  // ⚠ And the honest limit: a REPLY frame is well-formed CBOR with no
+  // `op`, so the missing key reports as an unknown operation.  A host
+  // chasing `unknown-op` is being pointed at version skew when the real
+  // fault is a frame going the wrong way.
+  assert(check_request(reply_ok(base64_encode("x"))) == ERR_UNKNOWN_OP,
+         "a reply frame at the request door reports {check_request(reply_ok(base64_encode(\"x\")))}");
+
+  // The vocabulary is exactly six, and nothing else is in it.
+  fd_n = 0;
+  for fd_o in [OP_INITIAL_STATE, OP_APPLY_OP, OP_MAKE_OP,
+               OP_RENDER, OP_SNAPSHOT, OP_LOAD_SNAPSHOT] {
+    if valid_op(fd_o) { fd_n = fd_n + 1; }
+  }
+  assert(fd_n == 6, "all six are in the vocabulary");
+  assert(!valid_op("") && !valid_op("eval"), "and nothing else is");
+}
+
+fn main() {
+  test_a_payload_is_base64_text();
+  test_only_reply_is_ok_classifies_a_reply();
+  test_the_front_door_checks_the_envelope();
+  println("pluginabi worked examples passed");
+}

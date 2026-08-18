@@ -111,6 +111,11 @@ fn test_check_request_is_the_front_door() {
 // ---------- a complete plugin, driven only by frames ----------
 // A counter: state is CBOR { "n": uint }; an op is CBOR { "d": uint } (a delta). The plugin owns
 // that encoding — the protocol only carries bytes, which is the §9c.2 contract.
+//
+// ⚠ This is the package's best worked example, which is why it is TAGGED rather than duplicated:
+// what a protocol library owes a reader is not a signature but the SHAPE OF A WHOLE EXCHANGE —
+// front door, dispatch, the six operations, a plugin refusing a well-formed request, and a host
+// rejecting an op the plugin body never sees.
 fn plug_state(n: integer) -> text {
   es: vector<CborEntry> = []; es += [ t_te("n", t_cuint(n)) ];
   return bytes_to_base64(encode(CMap { entries: es }));
@@ -146,6 +151,7 @@ fn plugin_dispatch(frame: vector<u8>) -> vector<u8> {
 
 fn call(op: text, st: text, ar: text) -> vector<u8> { return plugin_dispatch(request(op, st, ar)); }
 
+// @PAB-004 — a whole plugin driven end to end over nothing but frames
 fn test_a_whole_plugin_over_frames() {
   // initial_state
   r = call(OP_INITIAL_STATE, "", "");
