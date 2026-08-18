@@ -17,7 +17,7 @@ its own chunk rather than living in `loft-libs-net`.
 
 | Subdir | Package | Status |
 |---|---|---|
-| [`pluginabi/`](pluginabi/) | `pluginabi` — the plugin call protocol | v0.1.0 |
+| [`pluginabi/`](pluginabi/) | `pluginabi` — the plugin call protocol | v0.1.2 |
 
 ## `pluginabi` — what it is, and what it deliberately is not
 
@@ -47,6 +47,21 @@ generator and fuel metering before discovering loft already had the pieces — i
   out of the sandbox that is neither render output nor a value the host asked for.
 - **Replies fail closed.** Anything that is not a well-formed success — a truncated frame, garbage,
   even a *request* frame — reads as failure, so a garbled reply can never be read as success.
+
+### The four contracts a signature does not carry
+
+A frame is `vector<u8>` and every payload is `text`.  The signatures say bytes in / bytes out and
+text in / text out, and never that the text must be base64, that a reply hands back `""` for two
+opposite outcomes, or that the front door checks the envelope and not the letter.  Each row links
+to a test that demonstrates the correct call and runs in CI — the code is the documentation, so
+it cannot go stale.
+
+| contract | worked example |
+|---|---|
+| **Every payload is BASE64 text**, not the bytes and not the string.  `request(op, "hello", "")` is not an error — it is silent truncation to `"hell"`, because only that prefix is a whole base64 quantum.  Encode at the boundary (`base64_encode` for text, `bytes_to_base64` for binary). | [`@PAB-001`](pluginabi/tests/worked-examples.loft) |
+| **Only `reply_is_ok` classifies a reply.**  `reply_out_b64` answers `""` for a failure *and* for a success carrying an empty payload; `reply_err_code` answers `""` for a success.  Neither field is a verdict, in either direction — ask the verdict, then read the one field that outcome has. | [`@PAB-002`](pluginabi/tests/worked-examples.loft) |
+| **`check_request` validates the ENVELOPE, and `""` is its pass** (it returns the code to reply *with*, so it reads backwards from a boolean guard).  A known op with payload bytes no plugin could load passes; an `arg` sent for an operation that reads none passes; and a *reply* frame handed to it reports `unknown-op`, because a reply decodes fine and simply has no `op`. | [`@PAB-003`](pluginabi/tests/worked-examples.loft) |
+| **The shape of a whole exchange** — front door, dispatch, all six operations, a plugin refusing a well-formed request, and a host rejecting an op the plugin body never sees. | [`@PAB-004`](pluginabi/tests/pluginabi.loft) |
 
 ### Sandboxing
 
