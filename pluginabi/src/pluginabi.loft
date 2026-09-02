@@ -18,6 +18,34 @@
 // uses. Reusing it means the §8.15 determinism story needs no second encoding to reason about.
 //
 // Run: `loft test`.
+//
+// ---------- Using it ----------
+//
+// One vocabulary, used from BOTH ends — the host builds what the plugin reads,
+// and the same file is the only thing either side agrees on:
+//
+//     // host: build a request.  Payloads are opaque bytes, base64 in this API.
+//     st    = bytes_to_base64([1 as u8, 2 as u8, 255 as u8]);
+//     frame = pluginabi::request(pluginabi::OP_APPLY_OP, st,
+//                                bytes_to_base64([0 as u8, 7 as u8]));
+//
+//     // plugin: read it back
+//     pluginabi::req_op(frame)           // -> "apply_op"
+//     pluginabi::req_state_b64(frame)    // -> st, byte for byte
+//     pluginabi::check_request(frame)    // -> "" — the empty string means VALID
+//
+//     // plugin: answer
+//     ok  = pluginabi::reply_ok(bytes_to_base64([9 as u8, 9 as u8]));
+//     bad = pluginabi::reply_err("unknown_op");
+//     pluginabi::reply_is_ok(ok)         // -> true
+//     pluginabi::reply_err_code(bad)     // -> "unknown_op"
+//
+// The 255 and the 0 in those payloads are the point: they are not text, they
+// survive the round trip unchanged, and canonical CBOR is what makes that true.
+//
+// Validate before dispatching.  `check_request` and `reply_is_ok` are both
+// FAIL-CLOSED — an undecodable frame is invalid rather than empty — so a host
+// that skips them is guessing about a version skew instead of refusing it.
 use cbor;     // the published canonical-CBOR codec
 use crypto;   // base64 <-> bytes
 
@@ -80,6 +108,9 @@ pub const OP_RENDER:        text = "render";
 pub const OP_SNAPSHOT:      text = "snapshot";
 pub const OP_LOAD_SNAPSHOT: text = "load_snapshot";
 
+// Is this one of the six?  THE gate on the host side: an unknown op is a version
+// skew between plugin and host, and the only safe answer is to refuse rather
+// than to interpret.
 pub fn valid_op(op: text) -> boolean {
   return (op == OP_INITIAL_STATE) || (op == OP_APPLY_OP) || (op == OP_MAKE_OP)
       || (op == OP_RENDER) || (op == OP_SNAPSHOT) || (op == OP_LOAD_SNAPSHOT);
@@ -106,8 +137,16 @@ pub fn request(op: text, state_b64: text, arg_b64: text) -> vector<u8> {
   return encode(CMap { entries: es });
 }
 
+// Read the operation out of a request frame.  Answers "" for a frame that does
+// not decode, which `valid_op` then rejects — so a corrupt frame and an unknown
+// op take the same path.
 pub fn req_op(frame: vector<u8>) -> text        { return pa_text(pa_decode(frame), "op"); }
+// The state the host is handing over, base64.  Always present — the empty byte
+// string for `initial_state` — so a plugin never has to tell absent from empty.
 pub fn req_state_b64(frame: vector<u8>) -> text { return pa_bytes(pa_decode(frame), "state"); }
+// The operation's argument, base64.  Only `apply_op` and `make_op` carry one;
+// ask `takes_arg` first, because for the other four this is whatever the host
+// left in the slot.
 pub fn req_arg_b64(frame: vector<u8>) -> text   { return pa_bytes(pa_decode(frame), "arg"); }
 
 // ---------- reply frames ----------
@@ -124,6 +163,9 @@ pub fn reply_ok(out_b64: text) -> vector<u8> {
   return encode(CMap { entries: es });
 }
 
+// The failure reply.  `code` is a CODE and not a message: a free-form string
+// would be a channel out of the sandbox that nothing inspects, and the host is
+// what turns a code into words a person reads.
 pub fn reply_err(code: text) -> vector<u8> {
   es: vector<CborEntry> = [];
   es += [ pa_te("ok", pa_cbool(false)) ];
@@ -141,7 +183,12 @@ pub fn reply_is_ok(frame: vector<u8>) -> boolean {
   }
 }
 
+// The success payload, base64.  Only meaningful once `reply_is_ok` says yes —
+// on a failure reply it answers "", which is indistinguishable from an empty
+// success.
 pub fn reply_out_b64(frame: vector<u8>) -> text { return pa_bytes(pa_decode(frame), "out"); }
+// The failure code.  The other half of the same pair: check `reply_is_ok`, then
+// read exactly one of these two.
 pub fn reply_err_code(frame: vector<u8>) -> text { return pa_text(pa_decode(frame), "err"); }
 
 // ---------- the error codes a host may produce ----------
