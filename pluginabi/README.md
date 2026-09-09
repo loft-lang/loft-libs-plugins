@@ -139,11 +139,12 @@ cd pluginabi && loft test
 Stable and additive. Depends on `cbor` (the canonical-CBOR codec) and `crypto` (base64), and
 on nothing else — a published protocol library must stand on published dependencies alone.
 
-⚠ Every frame is a CBOR map, and `cbor`'s `encode` currently leaks one store per map
-([loft-libs-core#34](https://github.com/loft-lang/loft-libs-core/issues/34)). It is invisible
-without `LOFT_STORES=warn` and harmless in a short run, but a host driving many frames
-accumulates one store per frame; the fix belongs in `cbor` and nothing here changes when it
-lands.
+⚠ Every frame is a CBOR map, and building one currently leaks one store per KEY
+([loft#1491](https://github.com/loft-lang/loft/issues/1491)). It is invisible without
+`LOFT_STORES=warn` and harmless in a short run, but a host driving many frames accumulates
+one per key per frame. The defect is in the language, not in `cbor` and not here — a `match`
+arm that binds a collection local from a call and yields it does not release it — so nothing
+in either library changes when it lands.
 
 ## License
 
