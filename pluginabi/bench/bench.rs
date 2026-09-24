@@ -18,10 +18,28 @@
 //     strings out of the frame and answers a `Result`, and a map encoder that orders its
 //     entries through a `BTreeMap` keyed by the encoded key;
 //   - the base64 of the `crypto` package's native crate (native/src/base64.rs), by hand.
-// Where the loft API decodes a frame once per field it reads, the twin decodes once and
-// borrows every field off the one map — the census's idiom — and answers the same texts.
 // `black_box` guards each op's INPUT (the repetition number) and the sink — never anything
 // inside a kernel.
+//
+// THE SAME ALGORITHM IN EVERY LANE (bench/README.md § The row protocol, rule 1): the twin
+// follows the library's steps, not the shortest Rust route to the same answer.  Two rows carry
+// work the library does that an idiomatic implementation would not, and a library author
+// reading a ratio should know it is in BOTH lanes of that ratio:
+//   - `check_request` decodes the frame TWICE: `pa_decode_ok` builds the whole value tree to
+//     read its `ok`, then `pa_text(pa_decode(frame), "op")` builds it again to read one
+//     field.  An idiomatic port decodes once and asks both questions of that one value; the
+//     twin's `check_request` decodes twice, as the library does.
+//   - `req_state_b64` (the row's op reads all three fields — `req_op`, `req_state_b64`,
+//     `req_arg_b64`) decodes the frame THREE times, once per field, because each reader is
+//     `pa_<kind>(pa_decode(frame), key)` and nothing carries the decoded value between them.
+//     An idiomatic port decodes once and borrows the three fields off the one map; the twin's
+//     three readers each decode, scan the map for their key, and answer as the library does —
+//     the op as a fresh text, the state and the argument re-encoded to base64.
+// `request` needed no re-alignment: its three entries, two base64 decodes and canonical
+// encode are the library's steps already.  What the twin's decoder still does differently
+// is Rust's, not the library's: it borrows each string out of the frame where the loft
+// decoder copies it byte by byte into a fresh vector — that is the codec's representation,
+// and a ratio is allowed to see it.
 use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::time::Instant;
@@ -302,21 +320,55 @@ fn request(op: &str, state_b64: &str, arg_b64: &str) -> Vec<u8> {
     encode_map(m)
 }
 
-fn check_request(frame: &[u8]) -> &'static str {
+/// `pa_decode_ok`: the whole frame decoded — the value tree built and dropped — to answer
+/// whether it decodes.
+fn decode_ok(frame: &[u8]) -> bool {
+    decode(frame).is_ok()
+}
+
+/// `pa_text(pa_decode(frame), key)`: one decode, a linear scan of the map for `key`, the
+/// text answered as a fresh copy (`"{value}"`); "" for a frame that does not decode or a
+/// key that is absent or not a text.
+fn req_text(frame: &[u8], key: &str) -> String {
     match decode(frame) {
-        Err(Malformed) => ERR_MALFORMED,
-        Ok(v) if !valid_op(v.text("op")) => ERR_UNKNOWN_OP,
-        Ok(_) => "",
+        Ok(v) => v.text(key).to_string(),
+        Err(Malformed) => String::new(),
     }
 }
 
-/// op, state and arg off ONE decode — the state and argument answered as base64, as the
-/// library answers them.
-fn read_request(frame: &[u8]) -> (&str, String, String) {
+/// `pa_bytes(pa_decode(frame), key)`: one decode, a linear scan of the map for `key`, the
+/// byte string re-encoded to base64; "" for a frame that does not decode or a key that is
+/// absent or not a byte string.
+fn req_bytes_b64(frame: &[u8], key: &str) -> String {
     match decode(frame) {
-        Ok(v) => (v.text("op"), b64_encode(v.bytes("state")), b64_encode(v.bytes("arg"))),
-        Err(Malformed) => ("", String::new(), String::new()),
+        Ok(v) => b64_encode(v.bytes(key)),
+        Err(Malformed) => String::new(),
     }
+}
+
+fn req_op(frame: &[u8]) -> String {
+    req_text(frame, "op")
+}
+
+fn req_state_b64(frame: &[u8]) -> String {
+    req_bytes_b64(frame, "state")
+}
+
+fn req_arg_b64(frame: &[u8]) -> String {
+    req_bytes_b64(frame, "arg")
+}
+
+/// The library's two steps in the library's order: decode to ask `ok`, then decode AGAIN to
+/// read `op` (`pa_text(pa_decode(frame), "op")`), then the vocabulary check.
+fn check_request(frame: &[u8]) -> &'static str {
+    if !decode_ok(frame) {
+        return ERR_MALFORMED;
+    }
+    let op = req_op(frame);
+    if !valid_op(&op) {
+        return ERR_UNKNOWN_OP;
+    }
+    ""
 }
 
 // ── the workloads ───────────────────────────────────────────────────
@@ -364,17 +416,17 @@ fn bench_read(n: i64) -> Row {
     let (us, sink) = timed(n, |r| {
         let mut sum = 0i64;
         for i in 0..READS {
-            let (op, state, arg) = read_request(&frames[(i + r as usize) & 7]);
-            sum += (op.len() + state.len() + arg.len()) as i64;
+            let f = &frames[(i + r as usize) & 7];
+            sum += (req_op(f).len() + req_state_b64(f).len() + req_arg_b64(f).len()) as i64;
         }
         sum
     });
     let mut h = FNV_OFFSET;
     for i in 0..READS {
-        let (op, state, arg) = read_request(&frames[i & 7]);
-        h = fnv_bytes(h, op.as_bytes());
-        h = fnv_bytes(h, state.as_bytes());
-        h = fnv_bytes(h, arg.as_bytes());
+        let f = &frames[i & 7];
+        h = fnv_bytes(h, req_op(f).as_bytes());
+        h = fnv_bytes(h, req_state_b64(f).as_bytes());
+        h = fnv_bytes(h, req_arg_b64(f).as_bytes());
     }
     Row { name: "req_state_b64", iters: n, us, px: READS as i64, hash: h, sink }
 }
