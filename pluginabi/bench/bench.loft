@@ -1,0 +1,223 @@
+// Copyright (c) 2026 Jurjen Stellingwerff
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//
+// bench — the performance pass: the protocol's three hot doors, timed on a fixed workload,
+// with a hash of what they produced.
+//
+//     loft --interpret bench/bench.loft [--n N]         the interpreter
+//     loft --native-release bench/bench.loft [--n N]    compiled
+//     rustc -O --edition=2021 bench/bench.rs -o bench/.build/stats_rs   the Rust twin
+//
+// One tab-separated line per routine: name, iterations, total µs, ns per op, frames one op
+// processes, ns per frame, and an FNV-1a-32 hash of one canonical op's output.  The hash is
+// what makes a benchmark a VALIDATION: the interpreter, the native build and the pure-Rust
+// twin in bench/bench.rs must print the same hash for a row, or one of them is not computing
+// the routine it claims to — and only then does comparing their speeds mean anything.
+//
+//   check_request   the host's front door over a mix of valid, unknown-op and truncated frames
+//   req_state_b64   a plugin reading a request's three fields (op, 4 KiB state, arg)
+//   request         a host building a request frame from base64 state and argument
+//
+// The frames and base64 payloads are built once, before any timing, by the library's own
+// `request` and crypto's `bytes_to_base64`.  Repetition `r` rotates which frame or payload
+// each call takes — a value, never the amount of work (every frame in a set is the same
+// size, and each op walks every set a whole number of times) — so no backend can hoist an op
+// out of the repetition loop.  Each op's result is folded into `sink`.
+use pluginabi;
+use cbor;
+use crypto;
+
+/// One measured routine.
+struct Row {
+  name: text = "",
+  iters: integer = 0,
+  us: integer = 0,
+  px: integer = 0,
+  hash: integer = 0,
+  sink: integer = 0,
+}
+
+/// One prebuilt frame.
+struct Frame {
+  bytes: vector<u8>,
+}
+
+const FNV_OFFSET = 2166136261;
+const FNV_PRIME = 16777619;
+
+const CHECK_FRAMES = 32;      // a power of two: the rotation is `& 31`
+const CHECKS = 2048;
+const READ_FRAMES = 8;
+const READS = 32;
+const STATE_KIB = 4096;
+const REQ_PAYLOADS = 16;
+const REQUESTS = 512;
+const REQ_STATE = 512;
+
+/// The six operations, then one a host does not know.
+const OPS: vector<text> = ["initial_state", "apply_op", "make_op", "render", "snapshot",
+                           "load_snapshot", "reset"];
+
+/// FNV-1a-32 over every byte of a text, continuing from `h0`.
+fn fnv_text(h0: integer, t: text) -> integer {
+  ft_h = h0;
+  for i in 0..size(t) {
+    ft_h = ((ft_h ^ (t.byte_at(i) & 255)) * FNV_PRIME) & 0xFFFFFFFF;
+  }
+  ft_h
+}
+
+/// FNV-1a-32 over every byte of a byte vector, continuing from `h0`.
+fn fnv_bytes(h0: integer, v: const vector<u8>) -> integer {
+  fb_h = h0;
+  for b in v {
+    fb_h = ((fb_h ^ (b & 255)) * FNV_PRIME) & 0xFFFFFFFF;
+  }
+  fb_h
+}
+
+fn print_row(r: const Row) {
+  pr_ns = ((r.us * 1000) / r.iters) ?? 0;
+  pr_px = if r.px > 0 { (((r.us * 1000) as float) / ((r.iters * r.px) as float)) ?? 0.0 }
+          else { 0.0 };
+  println("{r.name}\t{r.iters}\t{r.us}\t{pr_ns}\t{r.px}\t{pr_px:.3}\t{r.hash:x}");
+}
+
+/// `n` opaque payload bytes, variant `v`: every value 0..255 appears, 0 and 255 included —
+/// the bytes the protocol exists to carry unchanged.
+fn payload(n: integer, v: integer) -> vector<u8> {
+  pl_out: vector<u8> = [];
+  for k in 0..n { pl_out += [(((k * 31 + v * 7) ^ (k >> 3)) & 255) as u8]; }
+  pl_out
+}
+
+fn payload_b64(n: integer, v: integer) -> text { bytes_to_base64(payload(n, v)) }
+
+// ── check_request: decode twice, then six text compares ─────────────
+
+/// 32 frames: op `OPS[j % 7]` (so one in seven is unknown), a 64-byte state and a 16-byte
+/// argument; every eighth frame loses its last byte, which no decode accepts.
+fn check_frames() -> vector<Frame> {
+  cf_out: vector<Frame> = [];
+  for j in 0..CHECK_FRAMES {
+    cf_f = pluginabi::request(OPS[j % 7]?, payload_b64(64, j), payload_b64(16, j + 100));
+    if (j & 7) == 7 {
+      cf_t: vector<u8> = [];
+      for k in 0..(len(cf_f) - 1) { cf_t += [cf_f[k]?]; }
+      cf_out += [Frame { bytes: cf_t }];
+    } else {
+      cf_out += [Frame { bytes: cf_f }];
+    }
+  }
+  cf_out
+}
+
+fn check_op(frames: vector<Frame>, r: integer) -> integer {
+  co_sum = 0;
+  for i in 0..CHECKS {
+    co_sum += size(pluginabi::check_request(frames[(i + r) & 31]?.bytes));
+  }
+  co_sum
+}
+
+fn bench_check(n: integer) -> Row {
+  bc_frames = check_frames();
+  bc_t0 = ticks();
+  bc_sink = 0;
+  for r in 0..n { bc_sink += check_op(bc_frames, r); }
+  bc_us = ticks() - bc_t0;
+  bc_h = FNV_OFFSET;
+  for i in 0..CHECKS {
+    bc_h = fnv_text(bc_h, pluginabi::check_request(bc_frames[i & 31]?.bytes));
+  }
+  Row { name: "check_request", iters: n, us: bc_us, px: CHECKS, hash: bc_h, sink: bc_sink }
+}
+
+// ── req_state_b64: a plugin reads op, state and arg, one decode each ──
+
+fn read_frames() -> vector<Frame> {
+  rf_out: vector<Frame> = [];
+  for j in 0..READ_FRAMES {
+    rf_out += [Frame { bytes: pluginabi::request(OPS[j % 6]?, payload_b64(STATE_KIB, j),
+                                                 payload_b64(32, j + 50)) }];
+  }
+  rf_out
+}
+
+fn read_op(frames: vector<Frame>, r: integer) -> integer {
+  ro_sum = 0;
+  for i in 0..READS {
+    ro_f = frames[(i + r) & 7]?.bytes;
+    ro_sum += size(pluginabi::req_op(ro_f)) + size(pluginabi::req_state_b64(ro_f))
+            + size(pluginabi::req_arg_b64(ro_f));
+  }
+  ro_sum
+}
+
+fn bench_read(n: integer) -> Row {
+  br_frames = read_frames();
+  br_t0 = ticks();
+  br_sink = 0;
+  for r in 0..n { br_sink += read_op(br_frames, r); }
+  br_us = ticks() - br_t0;
+  br_h = FNV_OFFSET;
+  for i in 0..READS {
+    br_f = br_frames[i & 7]?.bytes;
+    br_h = fnv_text(br_h, pluginabi::req_op(br_f));
+    br_h = fnv_text(br_h, pluginabi::req_state_b64(br_f));
+    br_h = fnv_text(br_h, pluginabi::req_arg_b64(br_f));
+  }
+  Row { name: "req_state_b64", iters: n, us: br_us, px: READS, hash: br_h, sink: br_sink }
+}
+
+// ── request: three entries built, two base64 decodes, a canonical encode ──
+
+fn request_op(states: const vector<text>, args: const vector<text>, r: integer) -> integer {
+  qo_sum = 0;
+  for i in 0..REQUESTS {
+    qo_f = pluginabi::request(OPS[i % 6]?, states[(i + r) & 15]?, args[(i + r) & 15]?);
+    qo_sum += len(qo_f);
+  }
+  qo_sum
+}
+
+fn bench_request(n: integer) -> Row {
+  bq_states: vector<text> = [];
+  bq_args: vector<text> = [];
+  for j in 0..REQ_PAYLOADS {
+    bq_states += [payload_b64(REQ_STATE, j)];
+    bq_args += [payload_b64(32, j + 200)];
+  }
+  bq_t0 = ticks();
+  bq_sink = 0;
+  for r in 0..n { bq_sink += request_op(bq_states, bq_args, r); }
+  bq_us = ticks() - bq_t0;
+  bq_h = FNV_OFFSET;
+  for i in 0..REQUESTS {
+    bq_h = fnv_bytes(bq_h, pluginabi::request(OPS[i % 6]?, bq_states[i & 15]?, bq_args[i & 15]?));
+  }
+  Row { name: "request", iters: n, us: bq_us, px: REQUESTS, hash: bq_h, sink: bq_sink }
+}
+
+fn main() {
+  mn_n = 20;
+  mn_args = arguments();
+  mn_i = 0;
+  while mn_i < len(mn_args) {
+    if mn_args[mn_i]? == "--n" && mn_i + 1 < len(mn_args) {
+      mn_n = (mn_args[mn_i + 1]? as integer?)?;
+      mn_i += 1;
+    }
+    mn_i += 1;
+  }
+  if mn_n < 1 { mn_n = 1; }
+  mn_t0 = ticks();
+  println("routine\titers\tus\tns_op\tpx\tns_px\thash");
+  mn_rows: vector<Row> = [bench_check(mn_n), bench_read(mn_n), bench_request(mn_n)];
+  mn_sink = 0;
+  for row in mn_rows {
+    print_row(row);
+    mn_sink += row.sink;
+  }
+  println("time: {(ticks() - mn_t0) / 1000}ms sink={mn_sink}");
+}
