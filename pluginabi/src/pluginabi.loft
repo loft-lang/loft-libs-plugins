@@ -48,8 +48,8 @@
 // that skips them is guessing about a version skew instead of refusing it.
 //
 // Example: @PAB-004
-use cbor;     // the published canonical-CBOR codec
-use crypto;   // base64 <-> bytes
+use cbor::*;     // the published canonical-CBOR codec
+use crypto::*;   // base64 <-> bytes
 
 // ---------- CBOR helpers ----------
 // Inlined rather than depending on a project-local CBOR wrapper: a published protocol library

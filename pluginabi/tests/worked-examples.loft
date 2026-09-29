@@ -23,9 +23,9 @@
 // `text` a reply hands back is `""` for two opposite outcomes, or that
 // the front door checks the envelope and not the letter.  Each is a
 // well-typed call that answers something other than it appears to.
-use pluginabi;
-use cbor;
-use crypto;
+use pluginabi::*;
+use cbor::*;
+use crypto::*;
 
 // Sending a payload.
 //

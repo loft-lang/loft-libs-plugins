@@ -3,9 +3,9 @@
 // The load-bearing test is the last one: a COMPLETE six-operation plugin driven end to end over
 // nothing but frames. If the protocol were missing something a real plugin needs, that test could
 // not be written — which is the point of writing it here rather than asserting field-by-field.
-use pluginabi;
-use cbor;
-use crypto;
+use pluginabi::*;
+use cbor::*;
+use crypto::*;
 
 // Fixture helpers. The library keeps its CBOR shims PRIVATE — exporting them is not a protocol
 // library's job — so a test that builds its own payloads brings its own, exactly as a real plugin
