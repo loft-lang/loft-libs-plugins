@@ -23,9 +23,9 @@
 // each call takes — a value, never the amount of work (every frame in a set is the same
 // size, and each op walks every set a whole number of times) — so no backend can hoist an op
 // out of the repetition loop.  Each op's result is folded into `sink`.
-use pluginabi;
-use cbor;
-use crypto;
+use pluginabi::*;
+use cbor::*;
+use crypto::*;
 
 /// One measured routine.
 struct Row {
