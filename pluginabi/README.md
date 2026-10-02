@@ -71,7 +71,7 @@ the documentation, so it cannot go stale.
 
 | | worked example |
 |---|---|
-| **Every payload is BASE64 text**, not the bytes and not the string. `request(op, "hello", "")` is not an error — it is silent truncation to `"hell"`, the only whole base64 quantum in it. Encode at the boundary: `base64_encode` for text, `bytes_to_base64` for binary. | [`@PAB-001`](tests/worked-examples.loft) |
+| **Every payload is BASE64 text**, not the bytes and not the string. `request(op, "hello", "")` answers an empty frame, which `check_request` refuses as `malformed-frame`. Encode at the boundary: `base64_encode` for text, `bytes_to_base64` for binary. | [`@PAB-001`](tests/worked-examples.loft) |
 | **Only `reply_is_ok` classifies a reply.** `reply_out_b64` answers `""` for a failure *and* for a success carrying an empty payload; `reply_err_code` answers `""` for a success. Neither field is a verdict. Ask the verdict, then read the one field that outcome has. | [`@PAB-002`](tests/worked-examples.loft) |
 | **`check_request` validates the ENVELOPE, and `""` is its pass.** It returns the code to reply *with*, so it reads backwards from a boolean guard. A known op carrying payload bytes no plugin could load passes; a *reply* frame handed to it reports `unknown-op`, because a reply decodes fine and simply has no `op`. | [`@PAB-003`](tests/worked-examples.loft) |
 | **The shape of a whole exchange** — front door, dispatch, all six operations, a plugin refusing a well-formed request, and a host rejecting an op the plugin body never sees. | [`@PAB-004`](tests/pluginabi.loft) |

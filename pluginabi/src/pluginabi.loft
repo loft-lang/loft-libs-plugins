@@ -72,6 +72,10 @@ fn pa_decode(bytes: vector<u8>) -> CborValue {
 }
 fn pa_decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
 
+// Is `b64` a payload `base64_to_bytes` reads?  It answers the empty vector for text that is
+// not base64, so only `""` may decode to nothing.
+fn pa_is_base64(b64: text) -> boolean { b64 == "" || len(base64_to_bytes(b64)) > 0 }
+
 fn pa_get(m: CborValue, key: text) -> CborValue {
   // The `match` is the function's final EXPRESSION (fallback `CNull` in the arm tails), NOT a
   // statement followed by `return CNull`. Those two forms are logically identical, but the
@@ -132,8 +136,16 @@ pub fn takes_arg(op: text) -> boolean {
 // `state` is always present (the empty byte string for `initial_state`), so the plugin never has
 // to distinguish "absent" from "empty" — an absent-vs-empty ambiguity across a wire is exactly
 // the kind of thing that produces a plausible wrong answer instead of an error.
+//
+// ⚠ A payload that is not base64 answers an EMPTY frame, which `check_request` refuses as
+// `malformed-frame`.  Handing over a raw string by mistake (`"hello"` for its base64) is
+// then an error at the front door, not a state that arrives as nothing — only `""` decodes
+// to the empty byte string.
 // Example: @PAB-001
 pub fn request(op: text, state_b64: text, arg_b64: text) -> vector<u8> {
+  if !pa_is_base64(state_b64) || !pa_is_base64(arg_b64) {
+    return [];
+  }
   es: vector<CborEntry> = [];
   es += [ pa_te("op", pa_ctext(op)) ];
   es += [ pa_te("state", pa_cbytes(state_b64)) ];
