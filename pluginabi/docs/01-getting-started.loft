@@ -1,0 +1,122 @@
+// Copyright (c) 2026 Jurjen Stellingwerff
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// @NAME: Getting Started
+// @TITLE: Write a plugin as one dispatch function over frames, and drive it from a host.
+//
+// A host drives a plugin through six operations — `initial_state`, `apply_op`, `make_op`,
+// `render`, `snapshot`, `load_snapshot`.  `pluginabi` is the vocabulary of those calls: a
+// request frame (an operation, the plugin's state, an argument) and a reply frame (a payload,
+// or an error code), both canonical CBOR bytes.  The plugin's state is opaque bytes the plugin
+// owns; the host only carries it from one call to the next.
+//
+// It is not a runtime and not a sandbox.  How the frame travels — a direct call, as here, or a
+// wasm boundary — is the host's; what keeps a plugin safe is loft's admission control at load.
+use pluginabi::*;
+use crypto::*;      // bytes_to_base64, base64_to_bytes, base64_encode, base64_decode
+
+// The plugin: a counter whose whole state is ONE BYTE.  Every operation goes through the one
+// front door, `check_request`, before the plugin reads anything.
+fn counter(frame: vector<u8>) -> vector<u8> {
+  bad = check_request(frame);
+  if bad != "" { return reply_err(bad); }
+  op = req_op(frame);
+  st = base64_to_bytes(req_state_b64(frame));
+  n: integer = st[0] ?? 0;
+  if op == OP_INITIAL_STATE { return reply_ok(bytes_to_base64([0 as u8])); }
+  if op == OP_APPLY_OP {
+    k: integer = base64_to_bytes(req_arg_b64(frame))[0] ?? 0;
+    if n + k > 255 { return reply_err(ERR_PLUGIN); }   // a refusal: the state does not move
+    next: u8 = (n + k) as u8 ?? 0;
+    return reply_ok(bytes_to_base64([next]));
+  }
+  if op == OP_MAKE_OP { return reply_ok(req_arg_b64(frame)); }   // an op is its own bytes
+  if op == OP_RENDER { return reply_ok(base64_encode("count {n}")); }
+  if op == OP_SNAPSHOT || op == OP_LOAD_SNAPSHOT { return reply_ok(req_state_b64(frame)); }
+  reply_err(ERR_UNKNOWN_OP)
+}
+
+// The host's side: build a request, hand it over, get a reply frame back.
+fn call(op: text, state: text, arg: text) -> vector<u8> { counter(request(op, state, arg)) }
+
+fn main() {
+  st = reply_out_b64(call(OP_INITIAL_STATE, "", ""));
+  st = reply_out_b64(call(OP_APPLY_OP, st, bytes_to_base64([5 as u8])));
+  shown = base64_decode(reply_out_b64(call(OP_RENDER, st, "")));
+  println("state {st}, rendered '{shown}'");
+  assert(st == "BQ==" && shown == "count 5", "one byte, 5; and what the plugin draws");
+
+  // Every section below is a function, and `main` calls each one: a section nothing calls
+  // still compiles, but its assertions never run.
+  bytes_not_text();
+  ask_the_verdict_first();
+  the_vocabulary_is_closed();
+  a_snapshot_is_the_state();
+}
+
+// That prints:
+//
+//     state BQ==, rendered 'count 5'
+//
+// ## Every payload is base64 text
+//
+// A payload is the BASE64 of the bytes, never the bytes and never a plain string.  That keeps
+// 255 and 0 — values no text carries — intact across the round trip.  A plain string by mistake
+// gets no frame at all: `request` answers an empty frame, and the front door refuses it.
+
+fn bytes_not_text() {
+  st = reply_out_b64(call(OP_APPLY_OP, bytes_to_base64([5 as u8]), bytes_to_base64([250 as u8])));
+  assert(st == "/w==" && (base64_to_bytes(st)[0] ?? 0) == 255, "5 + 250 is the byte 255");
+  wrong = request(OP_APPLY_OP, "hello", "");
+  assert(len(wrong) == 0 && check_request(wrong) == ERR_MALFORMED, "a plain string is no frame");
+  assert(reply_err_code(counter(wrong)) == "malformed-frame", "and the plugin says so");
+  println("bytes   : 255 survives; \"hello\" is refused as {ERR_MALFORMED}");
+}
+
+// ## Ask the verdict first
+//
+// A plugin may refuse a well-formed request — this one refuses to count past 255.  Then
+// `reply_out_b64` answers "", exactly what a success with an empty payload answers, so only
+// `reply_is_ok` tells the two apart.  Ask it first, then read the one field that outcome has;
+// on a refusal the host keeps the state it already had.
+
+fn ask_the_verdict_first() {
+  st = bytes_to_base64([255 as u8]);
+  r = call(OP_APPLY_OP, st, bytes_to_base64([1 as u8]));
+  assert(!reply_is_ok(r) && reply_err_code(r) == ERR_PLUGIN, "256 does not fit in the byte");
+  assert(reply_out_b64(r) == "", "and its payload reads like an empty success");
+  if reply_is_ok(r) { st = reply_out_b64(r); }
+  assert(st == "/w==", "so the host keeps 255");
+  println("refusal : {reply_err_code(r)}, state stays {st}");
+}
+
+// ## The vocabulary is closed
+//
+// An operation outside the six is refused at the front door as `unknown-op` — never guessed at,
+// because a host and a plugin disagreeing about the vocabulary is version skew.  `takes_arg`
+// says which operations read the argument: `apply_op` and `make_op`, and no others.
+
+fn the_vocabulary_is_closed() {
+  r = call("explode", "", "");
+  assert(reply_err_code(r) == ERR_UNKNOWN_OP, "not one of the six");
+  assert(takes_arg(OP_APPLY_OP) && takes_arg(OP_MAKE_OP) && !takes_arg(OP_SNAPSHOT), "two take an arg");
+  println("closed  : 'explode' is {reply_err_code(r)}");
+}
+
+// ## A snapshot is the state
+//
+// `snapshot` hands the host bytes it can store, and `load_snapshot` takes them back.  This
+// plugin's snapshot is its state as it stands; a plugin with caches would drop them here.
+
+fn a_snapshot_is_the_state() {
+  st = bytes_to_base64([42 as u8]);
+  snap = reply_out_b64(call(OP_SNAPSHOT, st, ""));
+  back = reply_out_b64(call(OP_LOAD_SNAPSHOT, snap, ""));
+  assert(snap == "Kg==" && back == st, "42 out, 42 back");
+  println("snapshot: {snap} and back");
+}
+
+// ## Where to go next
+//
+// - `tests/worked-examples.loft` — `@PAB-001` … `@PAB-003`: base64 at the boundary, the
+//   verdict before the payload, and what the front door does and does not check.
+// - `tests/pluginabi.loft` — `@PAB-004`, a complete six-operation plugin end to end.
