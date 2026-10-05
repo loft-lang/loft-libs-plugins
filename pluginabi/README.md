@@ -15,6 +15,9 @@ loft program compiled to wasm already exposes a fixed host boundary that a host 
 the two sides need no generated shim and no embedded engine — they need to agree on what a
 frame *means*. That agreement is this file, and it is the only thing either end imports.
 
+A guide: [docs/01-getting-started.loft](docs/01-getting-started.loft) — a counter plugin
+and its host, over nothing but frames.
+
 ## Install
 
 ```sh
@@ -29,7 +32,7 @@ use pluginabi;
 
 ```loft
 use pluginabi;
-use crypto;
+use crypto::*;      // bytes_to_base64
 
 fn main() {
     // The host builds a request.  Every payload is BASE64 TEXT, never raw bytes.
@@ -71,7 +74,7 @@ the documentation, so it cannot go stale.
 
 | | worked example |
 |---|---|
-| **Every payload is BASE64 text**, not the bytes and not the string. `request(op, "hello", "")` is not an error — it is silent truncation to `"hell"`, the only whole base64 quantum in it. Encode at the boundary: `base64_encode` for text, `bytes_to_base64` for binary. | [`@PAB-001`](tests/worked-examples.loft) |
+| **Every payload is BASE64 text**, not the bytes and not the string. `request(op, "hello", "")` answers an empty frame, which `check_request` refuses as `malformed-frame`. Encode at the boundary: `base64_encode` for text, `bytes_to_base64` for binary. | [`@PAB-001`](tests/worked-examples.loft) |
 | **Only `reply_is_ok` classifies a reply.** `reply_out_b64` answers `""` for a failure *and* for a success carrying an empty payload; `reply_err_code` answers `""` for a success. Neither field is a verdict. Ask the verdict, then read the one field that outcome has. | [`@PAB-002`](tests/worked-examples.loft) |
 | **`check_request` validates the ENVELOPE, and `""` is its pass.** It returns the code to reply *with*, so it reads backwards from a boolean guard. A known op carrying payload bytes no plugin could load passes; a *reply* frame handed to it reports `unknown-op`, because a reply decodes fine and simply has no `op`. | [`@PAB-003`](tests/worked-examples.loft) |
 | **The shape of a whole exchange** — front door, dispatch, all six operations, a plugin refusing a well-formed request, and a host rejecting an op the plugin body never sees. | [`@PAB-004`](tests/pluginabi.loft) |
@@ -94,7 +97,7 @@ the documentation, so it cannot go stale.
 ## Dispatching, in full
 
 ```loft
-use pluginabi;
+use pluginabi::*;
 
 pub fn dispatch(frame: vector<u8>) -> vector<u8> {
   bad = check_request(frame);            // decode, then vocabulary — the single front door
@@ -138,13 +141,8 @@ cd pluginabi && loft test
 
 Stable and additive. Depends on `cbor` (the canonical-CBOR codec) and `crypto` (base64), and
 on nothing else — a published protocol library must stand on published dependencies alone.
-
-⚠ Every frame is a CBOR map, and building one currently leaks one store per KEY
-([loft#1491](https://github.com/loft-lang/loft/issues/1491)). It is invisible without
-`LOFT_STORES=warn` and harmless in a short run, but a host driving many frames accumulates
-one per key per frame. The defect is in the language, not in `cbor` and not here — a `match`
-arm that binds a collection local from a call and yields it does not release it — so nothing
-in either library changes when it lands.
+Building and reading frames leaks nothing: the guide runs clean under `LOFT_STORES=warn` on
+both backends.
 
 ## License
 

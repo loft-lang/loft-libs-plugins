@@ -1,21 +1,17 @@
-// pluginabi — the §9c.2 plugin call protocol (Track L4, step 1).
+// pluginabi — the plugin call protocol: six operations as frames on one channel.
 //
-// WHAT THIS IS. A plugin implements six pure functions (§9c.2). The host does NOT call them as
-// six named wasm exports — that would need a codegen feature loft does not have, and inventing a
-// per-plugin `(ptr,len)` ABI beside loft's own was the mistake the first two design drafts made.
-// Instead the host drives the plugin over the byte channel loft ALREADY exposes on every wasm it
-// compiles (`loft_io.loft_host_input_len` / `loft_host_input_copy` in, `loft_host_print` out,
-// pumped by the host) — exactly the shape `tools/wasm_debug_client.mjs` drives the debugger with.
+// WHAT THIS IS. A plugin implements six pure operations. The host does not call them as six
+// named wasm exports, and there is no per-plugin `(ptr,len)` ABI: the host drives the plugin
+// over the byte channel every loft wasm already exposes (`loft_io.loft_host_input_len` /
+// `loft_host_input_copy` in, `loft_host_print` out, pumped by the host).
 //
 // So the six operations are FRAMES on one channel, and this file is that frame vocabulary. It is
-// the only thing either side needs to agree on: no ABI, no shim, no runtime. See
-// doc/PLUGIN_RUNTIME.md § "P3 results".
+// the only thing either side needs to agree on: no ABI, no shim, no runtime.
 //
-// WHY CBOR AND NOT A TEXT PROTOCOL. The debugger's `D!:` frames are text because breakpoints and
-// expressions are text. Plugin payloads are opaque BYTES (state, ops, snapshots — §9c.2 says the
-// plugin owns their meaning), and they must survive a round-trip unchanged; canonical CBOR
-// already carries byte strings losslessly here and is what every other record in this project
-// uses. Reusing it means the §8.15 determinism story needs no second encoding to reason about.
+// WHY CBOR AND NOT A TEXT PROTOCOL. Plugin payloads are opaque BYTES (state, ops, snapshots —
+// the plugin owns their meaning), and they must survive a round trip unchanged; canonical CBOR
+// carries byte strings losslessly, and one canonical encoding is what makes a frame
+// deterministic.
 //
 // Run: `loft test`.
 //
@@ -36,9 +32,9 @@
 //
 //     // plugin: answer
 //     ok  = pluginabi::reply_ok(bytes_to_base64([9 as u8, 9 as u8]));
-//     bad = pluginabi::reply_err("unknown_op");
+//     bad = pluginabi::reply_err(pluginabi::ERR_UNKNOWN_OP);
 //     pluginabi::reply_is_ok(ok)         // -> true
-//     pluginabi::reply_err_code(bad)     // -> "unknown_op"
+//     pluginabi::reply_err_code(bad)     // -> "unknown-op"
 //
 // The 255 and the 0 in those payloads are the point: they are not text, they
 // survive the round trip unchanged, and canonical CBOR is what makes that true.
@@ -65,30 +61,23 @@ fn pa_cbool(b: boolean) -> CborValue     { return CBool { value: b }; }
 fn pa_cbytes(b64: text) -> CborValue { return CBytes { value: base64_to_bytes(b64) }; }
 fn pa_te(k: text, v: CborValue) -> CborEntry { return CborEntry { key: CText { value: k }, value: v }; }
 
-fn pa_decode(bytes: vector<u8>) -> CborValue {
-  d = decode(bytes);
-  v = d.value;      // local copy — returning d.value directly corrupts native (loft #425)
-  return v;
-}
+fn pa_decode(bytes: vector<u8>) -> CborValue { decode(bytes).value }
 fn pa_decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
 
+// Is `b64` a payload `base64_to_bytes` reads?  It answers the empty vector for text that is
+// not base64, so only `""` may decode to nothing.
+fn pa_is_base64(b64: text) -> boolean { b64 == "" || len(base64_to_bytes(b64)) > 0 }
+
 fn pa_get(m: CborValue, key: text) -> CborValue {
-  // The `match` is the function's final EXPRESSION (fallback `CNull` in the arm tails), NOT a
-  // statement followed by `return CNull`. Those two forms are logically identical, but the
-  // statement form corrupts the early-returned `r` once its embedded vector is large enough
-  // (~54 bytes) — on interpret AND native — because `r` is a heap CborValue and the fall-through
-  // path frees it while it is still the live return value. See loft#651. The expression form is
-  // the workaround until that is fixed; every plugin frame read funnels through here.
   match m {
     CMap { entries } => {
-      for i in 0..len(entries) {
-        e = entries[i] ?? CborEntry { key: CNull, value: CNull };
-        match e.key { CText { value } => { if value == key { r = e.value; return r; } }, _ => {} }
+      for e in entries {
+        match e.key { CText { value } => { if value == key { return e.value; } }, _ => {} }
       }
-      CNull
     },
-    _ => CNull,
+    _ => {}
   }
+  return CNull;
 }
 fn pa_text(m: CborValue, key: text) -> text {
   match pa_get(m, key) { CText { value } => { return "{value}"; }, _ => {} }
@@ -99,7 +88,7 @@ fn pa_bytes(m: CborValue, key: text) -> text {
   return "";
 }
 
-// ---------- the operation vocabulary (§9c.2) ----------
+// ---------- the operation vocabulary ----------
 // The six, and only these six. `valid_op` is the gate: a host that receives an unknown op must
 // reject rather than guess, because a plugin and host disagreeing about the vocabulary is a
 // version skew, not a request to be interpreted.
@@ -132,8 +121,16 @@ pub fn takes_arg(op: text) -> boolean {
 // `state` is always present (the empty byte string for `initial_state`), so the plugin never has
 // to distinguish "absent" from "empty" — an absent-vs-empty ambiguity across a wire is exactly
 // the kind of thing that produces a plausible wrong answer instead of an error.
+//
+// ⚠ A payload that is not base64 answers an EMPTY frame, which `check_request` refuses as
+// `malformed-frame`.  Handing over a raw string by mistake (`"hello"` for its base64) is
+// then an error at the front door, not a state that arrives as nothing — only `""` decodes
+// to the empty byte string.
 // Example: @PAB-001
 pub fn request(op: text, state_b64: text, arg_b64: text) -> vector<u8> {
+  if !pa_is_base64(state_b64) || !pa_is_base64(arg_b64) {
+    return [];
+  }
   es: vector<CborEntry> = [];
   es += [ pa_te("op", pa_ctext(op)) ];
   es += [ pa_te("state", pa_cbytes(state_b64)) ];
@@ -160,7 +157,7 @@ pub fn req_arg_b64(frame: vector<u8>) -> text   { return pa_bytes(pa_decode(fram
 //
 // A failure carries a CODE, not a message: the host shows it to a person, and a free-form string
 // from the plugin would be the one channel out of the sandbox that is neither bytes-the-host-
-// inspects (render) nor a value it asked for. §9c.5 keeps render output the only rich channel.
+// inspects (render) nor a value it asked for: render output stays the only rich channel.
 // Example: @PAB-001
 pub fn reply_ok(out_b64: text) -> vector<u8> {
   es: vector<CborEntry> = [];
@@ -203,7 +200,7 @@ pub fn reply_err_code(frame: vector<u8>) -> text { return pa_text(pa_decode(fram
 // ---------- the error codes a host may produce ----------
 // Closed set, so a host and a UI cannot drift. `ERR_UNKNOWN_OP` is the version-skew case above;
 // `ERR_MALFORMED` is a frame that did not decode; `ERR_PLUGIN` is the plugin reporting it could
-// not satisfy a well-formed request (§9c.2 permits that — e.g. load_snapshot on foreign bytes).
+// not satisfy a well-formed request (which a plugin may — e.g. load_snapshot on foreign bytes).
 pub const ERR_UNKNOWN_OP: text = "unknown-op";
 pub const ERR_MALFORMED:  text = "malformed-frame";
 pub const ERR_PLUGIN:     text = "plugin-error";
@@ -211,7 +208,7 @@ pub const ERR_PLUGIN:     text = "plugin-error";
 // Validate an inbound request frame the way a host must, BEFORE dispatching it: decode, then
 // check the vocabulary. Returns "" when the frame is acceptable, else the error code to reply
 // with. Centralised so every host does the same two checks in the same order rather than each
-// re-deriving them — the §9c.2 contract has one front door.
+// re-deriving them — the contract has one front door.
 // Example: @PAB-003
 pub fn check_request(frame: vector<u8>) -> text {
   if !pa_decode_ok(frame) { return ERR_MALFORMED; }

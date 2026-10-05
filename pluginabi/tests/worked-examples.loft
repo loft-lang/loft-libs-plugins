@@ -31,23 +31,17 @@ use crypto::*;
 //
 // ⚠⚠ **Every payload crossing this API is BASE64 TEXT, not the bytes and
 // not the string.**  The frame is `vector<u8>`, so the base64 layer is
-// invisible at the call site — and handing `request` a raw string is not
-// an error, it is silent truncation to whatever prefix happens to be a
-// whole base64 quantum.
-// @PAB-001 — a payload is base64 text, and a raw string is silently cut
+// invisible at the call site — so `request` checks it: a raw string that is
+// not base64 answers an empty frame, which the front door refuses.
+// @PAB-001 — a payload is base64 text, and a raw string is refused at the front door
 fn test_a_payload_is_base64_text() {
-  // ⚠ The mistake, spelled the way it types.  "hello" is five characters
-  // that `base64_to_bytes` reads as base64: "hell" is one whole quantum
-  // (three bytes) and the trailing "o" is an incomplete one, dropped.
+  // ⚠ The mistake, spelled the way it types.  "hello" is five characters and
+  // not base64 — `base64_to_bytes` answers nothing for it — so `request`
+  // answers an empty frame, and the front door refuses it as malformed.
   pb_wrong = request(OP_APPLY_OP, "hello", "");
-  assert(req_state_b64(pb_wrong) == "hell",
-         "the payload came back as [{req_state_b64(pb_wrong)}]");
-  assert(len(base64_to_bytes("hello")) == 3, "five characters became three bytes");
-
-  // Nothing anywhere failed: the op is intact, the frame decodes, and the
-  // state a plugin receives is three bytes it never asked for.
-  assert(req_op(pb_wrong) == OP_APPLY_OP, "the frame is well formed");
-  assert(check_request(pb_wrong) == "", "and the front door admits it");
+  assert(len(base64_to_bytes("hello")) == 0, "a raw string is not base64");
+  assert(len(pb_wrong) == 0, "so there is no frame to send");
+  assert(check_request(pb_wrong) == ERR_MALFORMED, "and the front door says so");
 
   // The correct spelling — encode at the boundary, decode at the far end:
   pb_right = request(OP_APPLY_OP, base64_encode("hello"), "");
