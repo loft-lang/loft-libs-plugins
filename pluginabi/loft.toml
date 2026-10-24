@@ -1,6 +1,6 @@
 [package]
 name = "pluginabi"
-version = "0.1.8"
+version = "0.1.9"
 loft = ">=2026.10.0"
 api_compatible_with  = "0.1.0"   # oldest own release this is a drop-in for
 data_compatible_with = "0.1.0"   # oldest own release whose stored data this reads
@@ -11,5 +11,5 @@ repository = "loft-libs-plugins"
 entry = "src/pluginabi.loft"
 
 [dependencies]
-cbor = "0.1.12"  # reads its variant fields, `pub` from 0.1.12 (loft C140)
+cbor = ">=0.1.12"  # a FLOOR: reads its variant fields, `pub` from 0.1.12 (loft C140). A bare version is an exact pin.
 crypto = ">=0.3.11"
