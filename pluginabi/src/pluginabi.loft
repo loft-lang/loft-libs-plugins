@@ -64,9 +64,6 @@ fn pa_te(k: text, v: CborValue) -> CborEntry { return CborEntry { key: CText { v
 fn pa_decode(bytes: vector<u8>) -> CborValue { decode(bytes).value }
 fn pa_decode_ok(bytes: vector<u8>) -> boolean { d = decode(bytes); return d.ok; }
 
-// Is `b64` a payload `base64_to_bytes` reads?  It answers the empty vector for text that is
-// not base64, so only `""` may decode to nothing.
-fn pa_is_base64(b64: text) -> boolean { b64 == "" || len(base64_to_bytes(b64)) > 0 }
 
 fn pa_get(m: CborValue, key: text) -> CborValue {
   match m {
@@ -128,13 +125,17 @@ pub fn takes_arg(op: text) -> boolean {
 // to the empty byte string.
 // Example: @PAB-001
 pub fn request(op: text, state_b64: text, arg_b64: text) -> vector<u8> {
-  if !pa_is_base64(state_b64) || !pa_is_base64(arg_b64) {
+  // Each payload is decoded once, and checked on what it decoded to: `base64_to_bytes`
+  // answers the empty vector for text that is not base64, so only `""` may decode to nothing.
+  state = base64_to_bytes(state_b64);
+  arg = base64_to_bytes(arg_b64);
+  if (len(state) == 0 && state_b64 != "") || (len(arg) == 0 && arg_b64 != "") {
     return [];
   }
   es: vector<CborEntry> = [];
   es += [ pa_te("op", pa_ctext(op)) ];
-  es += [ pa_te("state", pa_cbytes(state_b64)) ];
-  es += [ pa_te("arg", pa_cbytes(arg_b64)) ];
+  es += [ pa_te("state", CBytes { value: state }) ];
+  es += [ pa_te("arg", CBytes { value: arg }) ];
   return encode(CMap { entries: es });
 }
 

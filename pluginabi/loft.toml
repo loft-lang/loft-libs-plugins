@@ -1,6 +1,6 @@
 [package]
 name = "pluginabi"
-version = "0.1.9"
+version = "0.1.10"
 loft = ">=2026.10.0"
 api_compatible_with  = "0.1.0"   # oldest own release this is a drop-in for
 data_compatible_with = "0.1.0"   # oldest own release whose stored data this reads

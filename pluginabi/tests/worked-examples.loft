@@ -42,6 +42,8 @@ fn test_a_payload_is_base64_text() {
   assert(len(base64_to_bytes("hello")) == 0, "a raw string is not base64");
   assert(len(pb_wrong) == 0, "so there is no frame to send");
   assert(check_request(pb_wrong) == ERR_MALFORMED, "and the front door says so");
+  assert(check_request(request(OP_APPLY_OP, "", "hello")) == ERR_MALFORMED,
+         "an argument that is not base64 is refused the same way");
 
   // The correct spelling — encode at the boundary, decode at the far end:
   pb_right = request(OP_APPLY_OP, base64_encode("hello"), "");
